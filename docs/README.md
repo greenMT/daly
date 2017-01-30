@@ -36,3 +36,11 @@
 * `PRINT`
 
 * `CLONE`
+
+* `LOOP`
+    marks a loop header
+
+* `BREAK`
+    marks end of a loop
+
+
