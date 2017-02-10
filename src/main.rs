@@ -23,7 +23,7 @@ pub enum Comp {
     Ge,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Instruction {
     Call(String),
     Return,
@@ -51,6 +51,8 @@ pub enum Instruction {
     Len,
     Print,
     Clone,
+
+    Guard(bool),
 }
 
 #[derive(Debug, Clone)]
@@ -132,94 +134,181 @@ impl<'a> CallFrame<'a> {
     }
 }
 
-pub struct Interpreter;
+pub struct Interpreter<'a> {
+    module: &'a Module,
+    stack: Vec<Value>,
+    frames: Vec<CallFrame<'a>>,
+}
 
 
-impl Interpreter {
+impl<'a> Interpreter<'a> {
+    fn new(module: &'a Module) -> Self {
+        Interpreter {
+            module: module,
+            stack: Vec::new(),
+            frames: Vec::new(),
+        }
+    }
 
-    fn run(&mut self, module: &Module) {
+    fn get_fn(&self, name: &str) -> &'a Func {
+        self.module.funcs.get(name).unwrap()
+    }
+
+    fn trace(&mut self, o_func: &'a Func, o_pc: usize) -> (&'a Func, usize) {
         use Instruction::*;
 
-        let main = module.funcs.get("main").unwrap();
+        let mut pc = o_pc;
+        let mut func = o_func;
 
-        let mut stack = Vec::new();
-        let mut frames = Vec::new();
-        let mut pc = 0;
-
-        frames.push(CallFrame::for_fn(&main, (&main, 0)));
-
-        let mut func = main;
+        let mut trace = Vec::new();
+        let mut stack_size = 0;
         loop {
             let instr = &func.instr[pc];
             // println!("{:?}", instr);
 
             pc += 1;
             match *instr {
-                Loop | Break => (),
+                Loop => {
+                    break;
+                },
+
+                Break => (),
+
                 Clone => (),
 
-                Const(n) => stack.push(Value::Usize(n)),
+                Const(n) => self.do_const(n),
+                Add => self.do_add(),
 
-                Add => {
-                    let left: usize = stack.pop().unwrap().into();
-                    let right: usize = stack.pop().unwrap().into();
+                Load(idx) => self.do_load(idx),
+                Store(idx) => self.do_store(idx),
 
-                    stack.push((left + right).into());
-                }
+                Print => self.do_print(),
 
-                Load(idx) => {
-                    stack.push(frames.last_mut().unwrap().locals[idx].clone());
-                }
+                Array(size) => self.do_array(size),
 
-                Store(idx) => {
-                    frames.last_mut().unwrap().locals[idx] = stack.pop().unwrap();
-                }
+                Len => self.do_len(),
+                Push => self.do_push(),
 
-                Print => {
-                    if let Value::Usize(v) = stack.pop().unwrap() {
-                        println!("{:?}", v);
-                    }
-                },
-
-                Array(size) => {
-                    stack.push(Vec::with_capacity(size).into());
-                },
-
-                Len => {
-                    let v: Vec<usize> = stack.pop().unwrap().into();
-                    stack.push(v.len().into());
-                }
-
-                Push => {
-                    // let mut v: &Vec<usize> = &mut
-                    let val = stack.pop().unwrap().into();
-                    stack.last_mut().unwrap().as_mut().push(val);
-                }
-
-                ArrayGet => {
-                    let index: usize = stack.pop().unwrap().into();
-                    let xs: Vec<usize> = stack.pop().unwrap().into();
-                    stack.push(xs[index].into());
-                }
+                ArrayGet => self.do_array_get(),
 
                 Call(ref target) => {
-                    let new_func = module.funcs.get(target).unwrap();
+                    let new_func = self.module.funcs.get(target).unwrap();
                     let mut frame = CallFrame::for_fn(new_func, (func, pc));
 
                     for idx in 0..frame.args {
-                        frame.locals[idx] = stack.pop().unwrap();
+                        frame.locals[idx] = self.stack.pop().unwrap();
                     }
 
-                    frames.push(frame);
+                    self.frames.push(frame);
+
+                    func = new_func;
+                    pc = 0;
+                    continue;
+                },
+
+                Return => {
+                    let frame = self.frames.pop();
+
+                    if self.frames.is_empty() {
+                        break;
+                    }
+
+                    let (f, rpc) = frame.unwrap().back_ref;
+                    func = f;
+                    pc = rpc;
+                    continue;
+                },
+
+                Cmp(how) => self.do_cmp(how),
+
+                Jump(target) => {
+                    pc = target;
+                    // don't trace
+                    continue;
+                }
+
+                JumpIfFalse(target) => {
+                    let b: bool = self.pop();
+                    if !bool::from(b) {
+                        pc = target;
+                    }
+
+                    trace.push(Guard(b));
+                    continue;
+
+                }
+
+                _ => panic!("TODO: {:?}", instr),
+            }
+
+            trace.push(instr.clone());
+        }
+
+        println!("{:?}", trace);
+
+        (func, pc)
+    }
+
+    fn run(&mut self) {
+        use Instruction::*;
+
+        let main = self.get_fn("main");
+
+        let mut pc = 0;
+
+        self.frames.push(CallFrame::for_fn(&main, (&main, 0)));
+
+        let mut func = main;
+
+        loop {
+            let instr = &func.instr[pc];
+            // println!("{:?}", instr);
+
+            pc += 1;
+            match *instr {
+                Loop => {
+                    let res = self.trace(func, pc);
+                    func = res.0;
+                    pc = res.1;
+                },
+
+                Break => (),
+
+                Clone => (),
+
+                Const(n) => self.do_const(n),
+                Add => self.do_add(),
+
+                Load(idx) => self.do_load(idx),
+                Store(idx) => self.do_store(idx),
+
+                Print => self.do_print(),
+
+                Array(size) => self.do_array(size),
+
+                Len => self.do_len(),
+                Push => self.do_push(),
+
+                ArrayGet => self.do_array_get(),
+
+                Call(ref target) => {
+                    let new_func = self.module.funcs.get(target).unwrap();
+                    let mut frame = CallFrame::for_fn(new_func, (func, pc));
+
+                    for idx in 0..frame.args {
+                        frame.locals[idx] = self.stack.pop().unwrap();
+                    }
+
+                    self.frames.push(frame);
 
                     func = new_func;
                     pc = 0;
                 },
 
                 Return => {
-                    let frame = frames.pop();
+                    let frame = self.frames.pop();
 
-                    if frames.is_empty() {
+                    if self.frames.is_empty() {
                         break;
                     }
 
@@ -228,25 +317,14 @@ impl Interpreter {
                     pc = rpc;
                 },
 
-                Cmp(how) => {
-                    let left: usize = stack.pop().unwrap().into();
-                    let right: usize = stack.pop().unwrap().into();
-
-                    let b = match how {
-                        Comp::Lt => left < right,
-                        Comp::Le => left <= right,
-                        _ => panic!("TODO"),
-                    };
-
-                    stack.push(b.into());
-                },
+                Cmp(how) => self.do_cmp(how),
 
                 Jump(target) => {
                     pc = target;
                 }
 
                 JumpIfFalse(target) => {
-                    if !bool::from(stack.pop().unwrap()) {
+                    if !bool::from(self.stack.pop().unwrap()) {
                         pc = target;
                     }
                 }
@@ -255,6 +333,74 @@ impl Interpreter {
 
             }
         }
+    }
+
+    fn push_stack<T: Into<Value>>(&mut self, val: T) {
+        self.stack.push(val.into());
+    }
+
+    fn pop<T>(&mut self) -> T
+    where T: From<Value>  {
+        self.stack.pop().unwrap().into()
+    }
+
+    fn do_add(&mut self) {
+        let left = self.pop::<usize>();
+        let right = self.pop::<usize>();
+
+        self.push_stack(left + right);
+    }
+
+    fn do_push(&mut self) {
+        let val = self.pop();
+        self.stack.last_mut().unwrap().as_mut().push(val);
+    }
+
+    fn do_const(&mut self, n: usize) {
+        self.stack.push(n.into());
+    }
+
+    fn do_load(&mut self, idx: usize) {
+        self.stack.push(self.frames.last_mut().unwrap().locals[idx].clone());
+    }
+
+    fn do_store(&mut self, idx: usize) {
+        self.frames.last_mut().unwrap().locals[idx] = self.stack.pop().unwrap();
+    }
+
+    fn do_len(&mut self) {
+        let v: Vec<usize> = self.pop();
+        self.stack.push(v.len().into());
+    }
+
+    fn do_print(&mut self) {
+        if let Value::Usize(v) = self.stack.pop().unwrap() {
+            println!("{:?}", v);
+        }
+    }
+
+    fn do_array(&mut self, capacity: usize) {
+        self.stack.push(Vec::with_capacity(capacity).into());
+    }
+
+    fn do_array_get(&mut self) {
+        let index: usize = self.pop();
+        let xs: Vec<usize> = self.pop();
+        self.stack.push(xs[index].into());
+
+    }
+
+    fn do_cmp(&mut self, how: Comp) {
+        let left: usize = self.pop();
+        let right: usize = self.pop();
+
+        let b = match how {
+            Comp::Lt => left < right,
+            Comp::Le => left <= right,
+            _ => panic!("TODO"),
+        };
+
+        self.stack.push(b.into());
     }
 }
 
@@ -280,12 +426,12 @@ fn main() {
                 name: "print".into(),
                 args: 1,
                 locals: 3,
-                instr: vec![Load(0), Const(0), ArrayGet, Store(1), Load(0), Len, Store(2), Const(0), Store(3), Load(2), Load(3), Cmp(Comp::Lt), JumpIfFalse(24), Load(0), Load(3), ArrayGet, Load(1), Call(String::from("min")), Store(1), Load(3), Const(1), Add, Store(3), Jump(9), Load(1), Print, Return],
+                instr: vec![Load(0), Const(0), ArrayGet, Store(1), Load(0), Len, Store(2), Const(0), Store(3), Loop, Load(2), Load(3), Cmp(Comp::Le), JumpIfFalse(25), Load(0), Load(3), ArrayGet, Load(1), Call(String::from("min")), Store(1), Load(3), Const(1), Add, Store(3), Jump(9), Break, Load(1), Print, Return],
             }
         }
     };
 
-    let mut interpreter = Interpreter;
+    let mut interpreter = Interpreter::new(&prog);
 
-    interpreter.run(&prog);
+    interpreter.run();
 }
