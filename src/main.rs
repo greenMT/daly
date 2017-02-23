@@ -1,18 +1,51 @@
 
-#[macro_use] extern crate maplit;
+#[macro_use]
+extern crate maplit;
+
+extern crate kaktus;
+
+use kaktus::{PushPop, Stack};
 
 use std::collections::BTreeMap;
+use std::cmp::max;
+
+use std::rc::Rc;
+
+// impl From for Value and vice versa
+mod conversions;
+mod recovery;
+mod tracerunner;
+mod util;
+
+use recovery::{Guard, FrameInfo};
+use tracerunner::Runner;
+
 
 pub struct Module {
-    funcs: BTreeMap<String, Func>,
+    funcs: BTreeMap<String, Rc<Func>>,
 }
 
+#[derive(Debug)]
+pub struct Trace {
+    pub trace: Vec<TraceInstruction>,
+    pub locals: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct Func {
     name: String,
     args: usize,
     locals: usize,
     instr: Vec<Instruction>,
 }
+
+#[derive(Debug, Clone)]
+pub struct FuncInfo {
+    name: String,
+    args: usize,
+    locals: usize,
+}
+
 
 #[derive(Debug, Clone, Copy)]
 pub enum Comp {
@@ -51,8 +84,29 @@ pub enum Instruction {
     Len,
     Print,
     Clone,
+}
 
-    Guard(bool),
+
+#[derive(Debug, Clone)]
+pub enum TraceInstruction {
+    Add,
+    Cmp(Comp),
+
+    Load(usize),
+    Store(usize),
+
+    Const(usize),
+
+    Array(usize),
+    ArrayGet,
+    Push,
+
+    // intrinsics
+    Len,
+    Print,
+    Clone,
+
+    Guard(Guard),
 }
 
 #[derive(Debug, Clone)]
@@ -63,81 +117,29 @@ pub enum Value {
     Array(Vec<usize>),
 }
 
-impl From<bool> for Value {
-    fn from(b: bool) -> Self {
-        Value::Bool(b)
-    }
-}
 
-impl From<Value> for bool {
-    fn from(val: Value) -> Self {
-        match val {
-            Value::Bool(b) => b,
-            _ => panic!("unexpeted Array variant"),
-        }
-    }
-}
-
-impl From<Vec<usize>> for Value {
-    fn from(xs: Vec<usize>) -> Self {
-        Value::Array(xs)
-    }
-}
-
-impl From<Value> for Vec<usize> {
-    fn from(val: Value) -> Self {
-        match val {
-            Value::Array(xs) => xs,
-            _ => panic!("unexpeted Array variant"),
-        }
-    }
-}
-
-impl AsMut<Vec<usize>> for Value {
-    fn as_mut(&mut self) -> &mut Vec<usize> {
-        match *self {
-            Value::Array(ref mut xs) => xs,
-            _ => panic!("unexpeted Array variant"),
-        }
-    }
-}
-
-
-// usize
-impl From<Value> for usize {
-    fn from(val: Value) -> Self {
-        match val {
-            Value::Usize(n) => n,
-            _ => panic!("unexpeted Array variant"),
-        }
-    }
-}
-
-impl From<usize> for Value {
-    fn from(n: usize) -> Self {
-        Value::Usize(n)
-    }
-}
-
-pub struct CallFrame<'a> {
-    back_ref: (&'a Func, usize),
+pub struct CallFrame {
+    back_ref: (Rc<Func>, usize),
     args: usize,
     locals: Vec<Value>,
 }
 
-impl<'a> CallFrame<'a> {
-    fn for_fn(func: &Func, back_ref: (&'a Func, usize)) -> Self {
+impl CallFrame {
+    fn for_fn(func: &Func, back_ref: (Rc<Func>, usize)) -> Self {
         CallFrame {
-            back_ref: back_ref,
+            back_ref: back_ref.clone(),
             args: func.args,
-            locals: vec![Value::Null; func.args+func.locals] }
+            locals: vec![Value::Null; func.args+func.locals],
+        }
     }
 }
+
+
 
 pub struct Interpreter<'a> {
     module: &'a Module,
     stack: Vec<Value>,
-    frames: Vec<CallFrame<'a>>,
+    frames: Vec<CallFrame>,
 }
 
 
@@ -150,27 +152,41 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    fn get_fn(&self, name: &str) -> &'a Func {
-        self.module.funcs.get(name).unwrap()
+    fn get_fn(&self, name: &str) -> Rc<Func> {
+        self.module.funcs.get(name).unwrap().clone()
     }
 
-    fn trace(&mut self, o_func: &'a Func, o_pc: usize) -> (&'a Func, usize) {
+    // XXX: why do I return func, pc? shouldn't that be the same as the input?
+    fn trace(&mut self, o_func: Rc<Func>, o_pc: usize) -> (Rc<Func>, usize, Trace) {
         use Instruction::*;
 
         let mut pc = o_pc;
-        let mut func = o_func;
+        let mut func = o_func.clone();
 
         let mut trace = Vec::new();
-        let mut stack_size = 0;
+
+        // offset from where we can add new locals
+        let mut stack_offset = func.args + func.locals;
+
+        let mut call_tree = Stack::root(FrameInfo {
+            func: o_func.clone(),
+            back_ref: self.frames.last().unwrap().back_ref.clone(),
+            offset: 0,
+        });
+
+        let mut stack_prefix = 0;
+        let mut stack_prefixes = vec![0];
+        let mut max_local = 0;
+
         loop {
-            let instr = &func.instr[pc];
-            // println!("{:?}", instr);
+            let instr = func.instr[pc].clone();
+            // println!("    DO: {:?}", instr);
 
             pc += 1;
-            match *instr {
+            match instr {
                 Loop => {
                     break;
-                },
+                }
 
                 Break => (),
 
@@ -179,8 +195,19 @@ impl<'a> Interpreter<'a> {
                 Const(n) => self.do_const(n),
                 Add => self.do_add(),
 
-                Load(idx) => self.do_load(idx),
-                Store(idx) => self.do_store(idx),
+                Load(idx) => {
+                    self.do_load(idx);
+                    trace.push(TraceInstruction::Load(stack_prefix + idx));
+                    continue;
+                }
+
+                Store(idx) => {
+                    self.do_store(idx);
+                    trace.push(TraceInstruction::Store(stack_prefix + idx));
+                    max_local = max(max_local, stack_prefix + idx);
+                    continue;
+
+                }
 
                 Print => self.do_print(),
 
@@ -192,32 +219,56 @@ impl<'a> Interpreter<'a> {
                 ArrayGet => self.do_array_get(),
 
                 Call(ref target) => {
-                    let new_func = self.module.funcs.get(target).unwrap();
-                    let mut frame = CallFrame::for_fn(new_func, (func, pc));
+                    let new_func = self.module.funcs.get(target).unwrap().clone();
+                    let mut frame = CallFrame::for_fn(&*new_func, (func.clone(), pc));
 
+                    // guard = guard.push(TraceGuard::new(
+                    // stack_offset,
+                    // new_func.into()));
+
+                    stack_prefixes.push(stack_prefix);
+                    stack_prefix = stack_offset;
+
+                    stack_offset += frame.locals.len();
+
+                    // trace.push(Call("xxx".into()));
                     for idx in 0..frame.args {
                         frame.locals[idx] = self.stack.pop().unwrap();
+                        trace.push(TraceInstruction::Store(stack_prefix + idx));
+                        max_local = max(max_local, stack_prefix + idx);
                     }
 
+                    // XXX: push frame instead?
+                    call_tree = call_tree.push(FrameInfo {
+                        func: new_func.clone(),
+                        back_ref: frame.back_ref.clone(),
+                        offset: stack_prefix,
+                    });
+
                     self.frames.push(frame);
+
 
                     func = new_func;
                     pc = 0;
                     continue;
-                },
+                }
 
                 Return => {
-                    let frame = self.frames.pop();
+                    stack_prefix = stack_prefixes.pop().unwrap();
 
+                    let frame = self.frames.pop();
                     if self.frames.is_empty() {
                         break;
                     }
+                    // trace.push(Return);
+
+                    call_tree = call_tree.pop().unwrap();
 
                     let (f, rpc) = frame.unwrap().back_ref;
                     func = f;
                     pc = rpc;
                     continue;
-                },
+                }
 
                 Cmp(how) => self.do_cmp(how),
 
@@ -233,7 +284,13 @@ impl<'a> Interpreter<'a> {
                         pc = target;
                     }
 
-                    trace.push(Guard(b));
+                    let guard = Guard {
+                        condition: b,
+                        frame: call_tree.clone(),
+                        // reverse pc +1 above
+                        pc: pc - 1,
+                    };
+                    trace.push(TraceInstruction::Guard(guard));
                     continue;
 
                 }
@@ -241,13 +298,19 @@ impl<'a> Interpreter<'a> {
                 _ => panic!("TODO: {:?}", instr),
             }
 
-            trace.push(instr.clone());
+            trace.push(TraceInstruction::from(instr));
         }
 
-        println!("{:?}", trace);
+        // println!("{:?}", trace);
 
-        (func, pc)
+        let t = Trace {
+            trace: trace,
+            locals: max_local + 1,
+        };
+
+        (func, pc, t)
     }
+
 
     fn run(&mut self) {
         use Instruction::*;
@@ -256,21 +319,39 @@ impl<'a> Interpreter<'a> {
 
         let mut pc = 0;
 
-        self.frames.push(CallFrame::for_fn(&main, (&main, 0)));
+        self.frames.push(CallFrame::for_fn(&*main, (main.clone(), 0)));
 
         let mut func = main;
 
+        let mut traces: BTreeMap<usize, Trace> = BTreeMap::new();
+
         loop {
-            let instr = &func.instr[pc];
-            // println!("{:?}", instr);
+            let instr = func.instr[pc].clone();
+            // println!("I: {:?}", instr);
 
             pc += 1;
-            match *instr {
+            match instr {
                 Loop => {
+                    if let Some(trace) = traces.get(&pc) {
+                        // println!("{:?}", trace);
+                        {
+                            let mut runner = Runner::new(self, &trace.trace, trace.locals);
+                            let res = runner.run();
+                            func = res.0;
+                            pc = res.1;
+                        }
+
+                        // println!("return from trace to func {:?} pc {:?}", func.name, pc);
+                        // println!("STACK: {:?}", self.stack);
+                        // println!("FRAME: {:?}", self.frames.last().unwrap().locals);
+                        continue;
+                    }
+
                     let res = self.trace(func, pc);
                     func = res.0;
                     pc = res.1;
-                },
+                    traces.insert(pc, res.2);
+                }
 
                 Break => (),
 
@@ -301,9 +382,9 @@ impl<'a> Interpreter<'a> {
 
                     self.frames.push(frame);
 
-                    func = new_func;
+                    func = new_func.clone();
                     pc = 0;
-                },
+                }
 
                 Return => {
                     let frame = self.frames.pop();
@@ -315,7 +396,7 @@ impl<'a> Interpreter<'a> {
                     let (f, rpc) = frame.unwrap().back_ref;
                     func = f;
                     pc = rpc;
-                },
+                }
 
                 Cmp(how) => self.do_cmp(how),
 
@@ -340,7 +421,8 @@ impl<'a> Interpreter<'a> {
     }
 
     fn pop<T>(&mut self) -> T
-    where T: From<Value>  {
+        where T: From<Value>
+    {
         self.stack.pop().unwrap().into()
     }
 
@@ -413,21 +495,21 @@ fn main() {
                 args: 0,
                 locals: 0,
                 instr: vec![Array(8), Const(9), Push, Const(3), Push, Const(4), Push, Const(5), Push, Const(6), Push, Const(1), Push, Const(3), Push, Const(2), Push, Const(4), Push, Call(String::from("min_list")), Return],
-            },
+            }.into(),
 
             "min".into() => Func {
                 name: "min".into(),
                 args: 2,
                 locals: 0,
                 instr: vec![Load(1), Load(0), Cmp(self::Comp::Le), JumpIfFalse(6), Load(0), Jump(8), Load(1), Jump(8), Clone, Return]
-            },
+            }.into(),
 
             "min_list".into() => Func {
-                name: "print".into(),
+                name: "min_list".into(),
                 args: 1,
                 locals: 3,
-                instr: vec![Load(0), Const(0), ArrayGet, Store(1), Load(0), Len, Store(2), Const(0), Store(3), Loop, Load(2), Load(3), Cmp(Comp::Le), JumpIfFalse(25), Load(0), Load(3), ArrayGet, Load(1), Call(String::from("min")), Store(1), Load(3), Const(1), Add, Store(3), Jump(9), Break, Load(1), Print, Return],
-            }
+                instr: vec![Load(0), Const(0), ArrayGet, Store(1), Load(0), Len, Store(2), Const(0), Store(3), Loop, Load(2), Load(3), Cmp(Comp::Lt), JumpIfFalse(25), Load(0), Load(3), ArrayGet, Load(1), Call(String::from("min")), Store(1), Load(3), Const(1), Add, Store(3), Jump(9), Break, Load(1), Print, Return],
+            }.into(),
         }
     };
 
