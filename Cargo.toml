@@ -6,3 +6,5 @@ authors = ["Jasper Schulz <jasper.b.schulz@gmail.com>"]
 [dependencies]
 maplit = "*"
 kaktus = "0.1.2"
+log = "0.3"
+env_logger = "0.3"

@@ -1,4 +1,6 @@
 
+// XXX: there might be a macro which implements From/Into for enums
+
 use super::*;
 
 impl From<bool> for Value {

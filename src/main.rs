@@ -1,35 +1,43 @@
 
+// btreemap! macro
 #[macro_use]
 extern crate maplit;
 
+#[macro_use]
+extern crate log;
+extern crate env_logger;
+
 extern crate kaktus;
 
-use kaktus::{PushPop, Stack};
 
 use std::collections::BTreeMap;
 use std::cmp::max;
-
 use std::rc::Rc;
 
-// impl From for Value and vice versa
+use kaktus::{PushPop, Stack};
+
+use recovery::{Guard, FrameInfo};
+use traits::vec::ConvertingStack;
+use tracerunner::Runner;
+
+
 mod conversions;
 mod recovery;
 mod tracerunner;
-mod util;
-
-use recovery::{Guard, FrameInfo};
-use tracerunner::Runner;
+mod traits;
 
 
 pub struct Module {
     funcs: BTreeMap<String, Rc<Func>>,
 }
 
+
 #[derive(Debug)]
 pub struct Trace {
     pub trace: Vec<TraceInstruction>,
     pub locals: usize,
 }
+
 
 #[derive(Debug, Clone)]
 pub struct Func {
@@ -38,6 +46,7 @@ pub struct Func {
     locals: usize,
     instr: Vec<Instruction>,
 }
+
 
 #[derive(Debug, Clone)]
 pub struct FuncInfo {
@@ -56,13 +65,13 @@ pub enum Comp {
     Ge,
 }
 
+
 #[derive(Debug, Clone)]
 pub enum Instruction {
     Call(String),
     Return,
 
     Add,
-
     Cmp(Comp),
 
     Jump(usize),
@@ -71,7 +80,6 @@ pub enum Instruction {
 
     Load(usize),
     Store(usize),
-
     Const(usize),
 
     Array(usize),
@@ -80,6 +88,7 @@ pub enum Instruction {
 
     Loop,
     Break,
+
     // intrinsics
     Len,
     Print,
@@ -94,7 +103,6 @@ pub enum TraceInstruction {
 
     Load(usize),
     Store(usize),
-
     Const(usize),
 
     Array(usize),
@@ -108,6 +116,7 @@ pub enum TraceInstruction {
 
     Guard(Guard),
 }
+
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -135,13 +144,11 @@ impl CallFrame {
 }
 
 
-
 pub struct Interpreter<'a> {
     module: &'a Module,
     stack: Vec<Value>,
     frames: Vec<CallFrame>,
 }
-
 
 impl<'a> Interpreter<'a> {
     fn new(module: &'a Module) -> Self {
@@ -153,7 +160,7 @@ impl<'a> Interpreter<'a> {
     }
 
     fn get_fn(&self, name: &str) -> Rc<Func> {
-        self.module.funcs.get(name).unwrap().clone()
+        self.module.funcs[name].clone()
     }
 
     // XXX: why do I return func, pc? shouldn't that be the same as the input?
@@ -176,19 +183,21 @@ impl<'a> Interpreter<'a> {
 
         let mut stack_prefix = 0;
         let mut stack_prefixes = vec![0];
+
+        // XXX: does this brake, if there are no local variables?
+        // eg: fn noop() {}
         let mut max_local = 0;
 
         loop {
             let instr = func.instr[pc].clone();
-            // println!("    DO: {:?}", instr);
-
             pc += 1;
-            match instr {
-                Loop => {
-                    break;
-                }
 
-                Break => (),
+            info!(target: "exec","TRACE: {:?}", instr);
+
+            match instr {
+                Loop => break,
+
+                Break => unimplemented!(),
 
                 Clone => (),
 
@@ -206,7 +215,6 @@ impl<'a> Interpreter<'a> {
                     trace.push(TraceInstruction::Store(stack_prefix + idx));
                     max_local = max(max_local, stack_prefix + idx);
                     continue;
-
                 }
 
                 Print => self.do_print(),
@@ -219,26 +227,19 @@ impl<'a> Interpreter<'a> {
                 ArrayGet => self.do_array_get(),
 
                 Call(ref target) => {
-                    let new_func = self.module.funcs.get(target).unwrap().clone();
+                    let new_func = self.module.funcs[target].clone();
                     let mut frame = CallFrame::for_fn(&*new_func, (func.clone(), pc));
-
-                    // guard = guard.push(TraceGuard::new(
-                    // stack_offset,
-                    // new_func.into()));
 
                     stack_prefixes.push(stack_prefix);
                     stack_prefix = stack_offset;
-
                     stack_offset += frame.locals.len();
 
-                    // trace.push(Call("xxx".into()));
                     for idx in 0..frame.args {
                         frame.locals[idx] = self.stack.pop().unwrap();
                         trace.push(TraceInstruction::Store(stack_prefix + idx));
                         max_local = max(max_local, stack_prefix + idx);
                     }
 
-                    // XXX: push frame instead?
                     call_tree = call_tree.push(FrameInfo {
                         func: new_func.clone(),
                         back_ref: frame.back_ref.clone(),
@@ -246,7 +247,6 @@ impl<'a> Interpreter<'a> {
                     });
 
                     self.frames.push(frame);
-
 
                     func = new_func;
                     pc = 0;
@@ -260,7 +260,6 @@ impl<'a> Interpreter<'a> {
                     if self.frames.is_empty() {
                         break;
                     }
-                    // trace.push(Return);
 
                     call_tree = call_tree.pop().unwrap();
 
@@ -274,12 +273,12 @@ impl<'a> Interpreter<'a> {
 
                 Jump(target) => {
                     pc = target;
-                    // don't trace
+                    // skip trace
                     continue;
                 }
 
                 JumpIfFalse(target) => {
-                    let b: bool = self.pop();
+                    let b: bool = self.stack.pop_into();
                     if !bool::from(b) {
                         pc = target;
                     }
@@ -287,12 +286,11 @@ impl<'a> Interpreter<'a> {
                     let guard = Guard {
                         condition: b,
                         frame: call_tree.clone(),
-                        // reverse pc +1 above
+                        // reverse `pc+=1` above
                         pc: pc - 1,
                     };
                     trace.push(TraceInstruction::Guard(guard));
                     continue;
-
                 }
 
                 _ => panic!("TODO: {:?}", instr),
@@ -301,79 +299,78 @@ impl<'a> Interpreter<'a> {
             trace.push(TraceInstruction::from(instr));
         }
 
-        // println!("{:?}", trace);
+        info!(target: "trace", "{:?}", trace);
 
-        let t = Trace {
+        (func,
+         pc,
+         Trace {
             trace: trace,
             locals: max_local + 1,
-        };
-
-        (func, pc, t)
+        })
     }
-
 
     fn run(&mut self) {
         use Instruction::*;
 
+        // `main` function has to exist
         let main = self.get_fn("main");
 
-        let mut pc = 0;
-
+        // a bit awkward, main would return to main
+        // maybe it would be better to have Option as back_ref
         self.frames.push(CallFrame::for_fn(&*main, (main.clone(), 0)));
 
         let mut func = main;
-
+        let mut pc = 0;
         let mut traces: BTreeMap<usize, Trace> = BTreeMap::new();
 
         loop {
-            let instr = func.instr[pc].clone();
-            // println!("I: {:?}", instr);
-
+            let instr = &func.clone().instr[pc];
             pc += 1;
-            match instr {
+
+            info!("E: {:?}", instr);
+
+            match *instr {
+                // currently there is no threshhold value when to start tracing
                 Loop => {
+                    // do we already have a trace for this position?
                     if let Some(trace) = traces.get(&pc) {
-                        // println!("{:?}", trace);
                         {
+                            info!("T: running trace @{:}[{:}]", func.name, pc);
+
                             let mut runner = Runner::new(self, &trace.trace, trace.locals);
                             let res = runner.run();
                             func = res.0;
                             pc = res.1;
                         }
 
-                        // println!("return from trace to func {:?} pc {:?}", func.name, pc);
-                        // println!("STACK: {:?}", self.stack);
-                        // println!("FRAME: {:?}", self.frames.last().unwrap().locals);
+                        info!("T: return from trace to func {:?} pc {:?}", func.name, pc);
+                        info!("T: STACK: {:?}", self.stack);
+                        info!("T: FRAME: {:?}", self.frames.last().unwrap().locals);
                         continue;
                     }
 
+                    // start tracing
                     let res = self.trace(func, pc);
                     func = res.0;
                     pc = res.1;
                     traces.insert(pc, res.2);
                 }
 
-                Break => (),
-
-                Clone => (),
+                // XXX
+                Break | Clone => (),
 
                 Const(n) => self.do_const(n),
                 Add => self.do_add(),
-
                 Load(idx) => self.do_load(idx),
                 Store(idx) => self.do_store(idx),
-
                 Print => self.do_print(),
-
                 Array(size) => self.do_array(size),
-
                 Len => self.do_len(),
                 Push => self.do_push(),
-
                 ArrayGet => self.do_array_get(),
 
                 Call(ref target) => {
-                    let new_func = self.module.funcs.get(target).unwrap();
+                    let new_func = &self.module.funcs[target];
                     let mut frame = CallFrame::for_fn(new_func, (func, pc));
 
                     for idx in 0..frame.args {
@@ -416,25 +413,13 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    fn push_stack<T: Into<Value>>(&mut self, val: T) {
-        self.stack.push(val.into());
-    }
-
-    fn pop<T>(&mut self) -> T
-        where T: From<Value>
-    {
-        self.stack.pop().unwrap().into()
-    }
-
     fn do_add(&mut self) {
-        let left = self.pop::<usize>();
-        let right = self.pop::<usize>();
-
-        self.push_stack(left + right);
+        let (left, right) = self.stack.pop_2_into::<usize>();
+        self.stack.push_from(left + right);
     }
 
     fn do_push(&mut self) {
-        let val = self.pop();
+        let val = self.stack.pop_into();
         self.stack.last_mut().unwrap().as_mut().push(val);
     }
 
@@ -451,8 +436,8 @@ impl<'a> Interpreter<'a> {
     }
 
     fn do_len(&mut self) {
-        let v: Vec<usize> = self.pop();
-        self.stack.push(v.len().into());
+        let v: Vec<usize> = self.stack.pop_into();
+        self.stack.push_from(v.len());
     }
 
     fn do_print(&mut self) {
@@ -462,32 +447,32 @@ impl<'a> Interpreter<'a> {
     }
 
     fn do_array(&mut self, capacity: usize) {
-        self.stack.push(Vec::with_capacity(capacity).into());
+        self.stack.push_from(Vec::with_capacity(capacity));
     }
 
     fn do_array_get(&mut self) {
-        let index: usize = self.pop();
-        let xs: Vec<usize> = self.pop();
-        self.stack.push(xs[index].into());
+        let index: usize = self.stack.pop_into();
+        let xs: Vec<usize> = self.stack.pop_into();
+        self.stack.push_from(xs[index]);
 
     }
 
     fn do_cmp(&mut self, how: Comp) {
-        let left: usize = self.pop();
-        let right: usize = self.pop();
-
-        let b = match how {
+        let (left, right) = self.stack.pop_2_into::<usize>();
+        self.stack.push_from(match how {
             Comp::Lt => left < right,
             Comp::Le => left <= right,
             _ => panic!("TODO"),
-        };
-
-        self.stack.push(b.into());
+        });
     }
 }
 
+
 fn main() {
     use Instruction::*;
+
+    env_logger::init().unwrap();
+
     let prog = Module {
         funcs: btreemap!{
             "main".into() => Func {
@@ -514,6 +499,5 @@ fn main() {
     };
 
     let mut interpreter = Interpreter::new(&prog);
-
     interpreter.run();
 }
