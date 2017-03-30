@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use kaktus::PushPop;
 
-use super::{TraceInstruction, Comp, Value, Interpreter, CallFrame, Func};
+use super::{TraceInstruction, Comp, Value, Interpreter, CallFrame, Func, Trace};
 use recovery::Guard;
 use traits::vec::ConvertingStack;
 
@@ -17,11 +17,10 @@ pub struct Runner<'a, 'b: 'a> {
 
 impl<'a, 'b> Runner<'a, 'b> {
     pub fn new(interp: &'a mut Interpreter<'b>,
-               trace: &'a [TraceInstruction],
-               n_locals: usize)
+               trace: &'a Trace)
                -> Self {
         // we have to copy over current stack frame from interpreter
-        let mut locals = vec![Value::Null; n_locals];
+        let mut locals = vec![Value::Null; trace.locals_count];
         {
             let interp_locals = &interp.frames.last().unwrap().locals;
             for idx in 0..interp_locals.len() {
@@ -31,7 +30,7 @@ impl<'a, 'b> Runner<'a, 'b> {
 
         Runner {
             interp: interp,
-            trace: trace,
+            trace: &trace.trace,
             stack: Vec::new(),
             locals: locals,
         }

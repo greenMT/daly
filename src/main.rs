@@ -11,7 +11,6 @@ extern crate kaktus;
 
 
 use std::collections::BTreeMap;
-use std::cmp::max;
 use std::rc::Rc;
 
 use kaktus::{PushPop, Stack};
@@ -35,7 +34,13 @@ pub struct Module {
 #[derive(Debug)]
 pub struct Trace {
     pub trace: Vec<TraceInstruction>,
-    pub locals: usize,
+    pub locals_count: usize,
+}
+
+impl Trace {
+    fn new(trace: Vec<TraceInstruction>, locals_count: usize) -> Self {
+        Trace { trace: trace, locals_count: locals_count }
+    }
 }
 
 
@@ -144,6 +149,36 @@ impl CallFrame {
 }
 
 
+struct TraceDataAllocator {
+    total_size: usize,
+    offsets: Vec<usize>,
+}
+
+impl TraceDataAllocator {
+    fn new() -> Self {
+        TraceDataAllocator { total_size: 0, offsets: Vec::new() }
+    }
+
+    fn alloc(&mut self, to_allocate: usize) {
+        self.offsets.push(self.total_size);
+        // reserve space at the end
+        self.total_size += to_allocate;
+    }
+
+    fn pop(&mut self) {
+        self.offsets.pop().unwrap();
+    }
+
+    fn current(&self) -> usize {
+        *self.offsets.last().unwrap()
+    }
+
+    fn at(&self, idx: usize) -> usize {
+        self.current() + idx
+    }
+}
+
+
 pub struct Interpreter<'a> {
     module: &'a Module,
     stack: Vec<Value>,
@@ -172,21 +207,14 @@ impl<'a> Interpreter<'a> {
 
         let mut trace = Vec::new();
 
-        // offset from where we can add new locals
-        let mut stack_offset = func.args + func.locals;
-
         let mut call_tree = Stack::root(FrameInfo {
             func: o_func.clone(),
             back_ref: self.frames.last().unwrap().back_ref.clone(),
             offset: 0,
         });
 
-        let mut stack_prefix = 0;
-        let mut stack_prefixes = vec![0];
-
-        // XXX: does this brake, if there are no local variables?
-        // eg: fn noop() {}
-        let mut max_local = 0;
+        let mut locals = TraceDataAllocator::new();
+        locals.alloc(func.args + func.locals);
 
         loop {
             let instr = func.instr[pc].clone();
@@ -206,14 +234,13 @@ impl<'a> Interpreter<'a> {
 
                 Load(idx) => {
                     self.do_load(idx);
-                    trace.push(TraceInstruction::Load(stack_prefix + idx));
+                    trace.push(TraceInstruction::Load(locals.at(idx)));
                     continue;
                 }
 
                 Store(idx) => {
                     self.do_store(idx);
-                    trace.push(TraceInstruction::Store(stack_prefix + idx));
-                    max_local = max(max_local, stack_prefix + idx);
+                    trace.push(TraceInstruction::Store(locals.at(idx)));
                     continue;
                 }
 
@@ -230,20 +257,17 @@ impl<'a> Interpreter<'a> {
                     let new_func = self.module.funcs[target].clone();
                     let mut frame = CallFrame::for_fn(&*new_func, (func.clone(), pc));
 
-                    stack_prefixes.push(stack_prefix);
-                    stack_prefix = stack_offset;
-                    stack_offset += frame.locals.len();
+                    locals.alloc(frame.locals.len());
 
                     for idx in 0..frame.args {
                         frame.locals[idx] = self.stack.pop().unwrap();
-                        trace.push(TraceInstruction::Store(stack_prefix + idx));
-                        max_local = max(max_local, stack_prefix + idx);
+                        trace.push(TraceInstruction::Store(locals.at(idx)));
                     }
 
                     call_tree = call_tree.push(FrameInfo {
                         func: new_func.clone(),
                         back_ref: frame.back_ref.clone(),
-                        offset: stack_prefix,
+                        offset: locals.current(),
                     });
 
                     self.frames.push(frame);
@@ -254,7 +278,7 @@ impl<'a> Interpreter<'a> {
                 }
 
                 Return => {
-                    stack_prefix = stack_prefixes.pop().unwrap();
+                    locals.pop();
 
                     let frame = self.frames.pop();
                     if self.frames.is_empty() {
@@ -303,10 +327,8 @@ impl<'a> Interpreter<'a> {
 
         (func,
          pc,
-         Trace {
-            trace: trace,
-            locals: max_local + 1,
-        })
+         Trace::new(trace, locals.total_size)
+        )
     }
 
     fn run(&mut self) {
@@ -337,7 +359,7 @@ impl<'a> Interpreter<'a> {
                         {
                             info!("T: running trace @{:}[{:}]", func.name, pc);
 
-                            let mut runner = Runner::new(self, &trace.trace, trace.locals);
+                            let mut runner = Runner::new(self, trace);
                             let res = runner.run();
                             func = res.0;
                             pc = res.1;
