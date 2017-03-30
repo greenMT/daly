@@ -7,27 +7,35 @@ extern crate maplit;
 extern crate log;
 extern crate env_logger;
 
+extern crate boolinator;
 extern crate kaktus;
-
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use kaktus::{PushPop, Stack};
 
+use bytecode::{Instruction, Comp};
 use recovery::{Guard, FrameInfo};
-use traits::vec::ConvertingStack;
 use tracerunner::Runner;
+use repr::{CallFrame, Func, InstrPtr, Value};
 
+use traits::vec::ConvertingStack;
 
+mod bytecode;
 mod conversions;
 mod recovery;
 mod tracerunner;
 mod traits;
+mod repr;
+
+
+pub type TraceMap = BTreeMap<usize, Trace>;
+pub type ModuleMap = BTreeMap<String, Rc<Func>>;
 
 
 pub struct Module {
-    funcs: BTreeMap<String, Rc<Func>>,
+    funcs: ModuleMap,
 }
 
 
@@ -39,65 +47,11 @@ pub struct Trace {
 
 impl Trace {
     fn new(trace: Vec<TraceInstruction>, locals_count: usize) -> Self {
-        Trace { trace: trace, locals_count: locals_count }
+        Trace {
+            trace: trace,
+            locals_count: locals_count,
+        }
     }
-}
-
-
-#[derive(Debug, Clone)]
-pub struct Func {
-    name: String,
-    args: usize,
-    locals: usize,
-    instr: Vec<Instruction>,
-}
-
-
-#[derive(Debug, Clone)]
-pub struct FuncInfo {
-    name: String,
-    args: usize,
-    locals: usize,
-}
-
-
-#[derive(Debug, Clone, Copy)]
-pub enum Comp {
-    Eq,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-}
-
-
-#[derive(Debug, Clone)]
-pub enum Instruction {
-    Call(String),
-    Return,
-
-    Add,
-    Cmp(Comp),
-
-    Jump(usize),
-    JumpIfTrue(usize),
-    JumpIfFalse(usize),
-
-    Load(usize),
-    Store(usize),
-    Const(usize),
-
-    Array(usize),
-    ArrayGet,
-    Push,
-
-    Loop,
-    Break,
-
-    // intrinsics
-    Len,
-    Print,
-    Clone,
 }
 
 
@@ -123,31 +77,6 @@ pub enum TraceInstruction {
 }
 
 
-#[derive(Debug, Clone)]
-pub enum Value {
-    Null,
-    Bool(bool),
-    Usize(usize),
-    Array(Vec<usize>),
-}
-
-
-pub struct CallFrame {
-    back_ref: (Rc<Func>, usize),
-    args: usize,
-    locals: Vec<Value>,
-}
-
-impl CallFrame {
-    fn for_fn(func: &Func, back_ref: (Rc<Func>, usize)) -> Self {
-        CallFrame {
-            back_ref: back_ref.clone(),
-            args: func.args,
-            locals: vec![Value::Null; func.args+func.locals],
-        }
-    }
-}
-
 
 struct TraceDataAllocator {
     total_size: usize,
@@ -156,7 +85,10 @@ struct TraceDataAllocator {
 
 impl TraceDataAllocator {
     fn new() -> Self {
-        TraceDataAllocator { total_size: 0, offsets: Vec::new() }
+        TraceDataAllocator {
+            total_size: 0,
+            offsets: Vec::new(),
+        }
     }
 
     fn alloc(&mut self, to_allocate: usize) {
@@ -199,30 +131,29 @@ impl<'a> Interpreter<'a> {
     }
 
     // XXX: why do I return func, pc? shouldn't that be the same as the input?
-    fn trace(&mut self, o_func: Rc<Func>, o_pc: usize) -> (Rc<Func>, usize, Trace) {
+    fn trace(&mut self, instr: &InstrPtr) -> (InstrPtr, Trace) {
         use Instruction::*;
-
-        let mut pc = o_pc;
-        let mut func = o_func.clone();
 
         let mut trace = Vec::new();
 
         let mut call_tree = Stack::root(FrameInfo {
-            func: o_func.clone(),
+            func: instr.func.clone(),
             back_ref: self.frames.last().unwrap().back_ref.clone(),
             offset: 0,
         });
 
         let mut locals = TraceDataAllocator::new();
-        locals.alloc(func.args + func.locals);
+        locals.alloc(instr.func.args_count + instr.func.locals_count);
+
+        let mut next = instr.clone();
 
         loop {
-            let instr = func.instr[pc].clone();
-            pc += 1;
+            let instr = next;
+            next = instr.next();
 
             info!(target: "exec","TRACE: {:?}", instr);
 
-            match instr {
+            match *instr {
                 Loop => break,
 
                 Break => unimplemented!(),
@@ -254,12 +185,12 @@ impl<'a> Interpreter<'a> {
                 ArrayGet => self.do_array_get(),
 
                 Call(ref target) => {
-                    let new_func = self.module.funcs[target].clone();
-                    let mut frame = CallFrame::for_fn(&*new_func, (func.clone(), pc));
+                    let new_func = &self.module.funcs[target];
+                    let mut frame = CallFrame::for_fn(new_func, next);
 
                     locals.alloc(frame.locals.len());
 
-                    for idx in 0..frame.args {
+                    for idx in 0..frame.args_count {
                         frame.locals[idx] = self.stack.pop().unwrap();
                         trace.push(TraceInstruction::Store(locals.at(idx)));
                     }
@@ -271,9 +202,9 @@ impl<'a> Interpreter<'a> {
                     });
 
                     self.frames.push(frame);
+                    next = InstrPtr::for_fn(new_func.clone());
 
-                    func = new_func;
-                    pc = 0;
+                    // don't add Call to trace
                     continue;
                 }
 
@@ -287,16 +218,16 @@ impl<'a> Interpreter<'a> {
 
                     call_tree = call_tree.pop().unwrap();
 
-                    let (f, rpc) = frame.unwrap().back_ref;
-                    func = f;
-                    pc = rpc;
+                    next = frame.unwrap().back_ref;
+
+                    // don't add Return to trace
                     continue;
                 }
 
                 Cmp(how) => self.do_cmp(how),
 
                 Jump(target) => {
-                    pc = target;
+                    next = next.jump(target);
                     // skip trace
                     continue;
                 }
@@ -304,14 +235,13 @@ impl<'a> Interpreter<'a> {
                 JumpIfFalse(target) => {
                     let b: bool = self.stack.pop_into();
                     if !bool::from(b) {
-                        pc = target;
+                        next = next.jump(target);
                     }
 
                     let guard = Guard {
                         condition: b,
                         frame: call_tree.clone(),
-                        // reverse `pc+=1` above
-                        pc: pc - 1,
+                        pc: instr.pc,
                     };
                     trace.push(TraceInstruction::Guard(guard));
                     continue;
@@ -320,15 +250,12 @@ impl<'a> Interpreter<'a> {
                 _ => panic!("TODO: {:?}", instr),
             }
 
-            trace.push(TraceInstruction::from(instr));
+            trace.push(TraceInstruction::from(&*instr));
         }
 
         info!(target: "trace", "{:?}", trace);
 
-        (func,
-         pc,
-         Trace::new(trace, locals.total_size)
-        )
+        (instr.clone(), Trace::new(trace, locals.total_size))
     }
 
     fn run(&mut self) {
@@ -339,98 +266,98 @@ impl<'a> Interpreter<'a> {
 
         // a bit awkward, main would return to main
         // maybe it would be better to have Option as back_ref
-        self.frames.push(CallFrame::for_fn(&*main, (main.clone(), 0)));
+        self.frames.push(CallFrame::for_fn(&main, InstrPtr::new(main.clone(), 0)));
 
-        let mut func = main;
-        let mut pc = 0;
-        let mut traces: BTreeMap<usize, Trace> = BTreeMap::new();
+        let mut traces = TraceMap::new();
+        let mut next = InstrPtr::for_fn(main.clone());
 
         loop {
-            let instr = &func.clone().instr[pc];
-            pc += 1;
+            // get next instruction
+            let instr = next;
+            // pre-set next instruction
+            next = instr.next();
 
-            info!("E: {:?}", instr);
+            info!("E: {:?}", *instr);
 
             match *instr {
-                // currently there is no threshhold value when to start tracing
+                // XXX: do I care about break here?
+                Break | Clone => (),
+
+                // simple dispatch of opcodes to callbacks
+                Const(n)    => self.do_const(n),
+                Add         => self.do_add(),
+                Load(idx)   => self.do_load(idx),
+                Store(idx)  => self.do_store(idx),
+                Print       => self.do_print(),
+                Array(size) => self.do_array(size),
+                Len         => self.do_len(),
+                Push        => self.do_push(),
+                ArrayGet    => self.do_array_get(),
+                Cmp(how)    => self.do_cmp(how),
+
+                // XXX: currently there is no threshhold value when to start tracing
+                // meaning that tracing starts immediately
                 Loop => {
                     // do we already have a trace for this position?
-                    if let Some(trace) = traces.get(&pc) {
+                    if let Some(trace) = traces.get(&instr.pc) {
+                        // we need this block, since Runner takes self as &mut
                         {
-                            info!("T: running trace @{:}[{:}]", func.name, pc);
-
+                            info!("T: running trace @{:}[{:}]", instr.func.name, instr.pc);
                             let mut runner = Runner::new(self, trace);
-                            let res = runner.run();
-                            func = res.0;
-                            pc = res.1;
+                            next = runner.run();
                         }
-
-                        info!("T: return from trace to func {:?} pc {:?}", func.name, pc);
+                        info!("T: return from trace to func {:?} pc {:?}", next.func.name, next.pc);
                         info!("T: STACK: {:?}", self.stack);
                         info!("T: FRAME: {:?}", self.frames.last().unwrap().locals);
                         continue;
                     }
 
-                    // start tracing
-                    let res = self.trace(func, pc);
-                    func = res.0;
-                    pc = res.1;
-                    traces.insert(pc, res.2);
+                    // no trace found => start tracing (with next instr)
+                    let res = self.trace(&next);
+                    next = res.0;
+                    traces.insert(instr.pc, res.1);
                 }
-
-                // XXX
-                Break | Clone => (),
-
-                Const(n) => self.do_const(n),
-                Add => self.do_add(),
-                Load(idx) => self.do_load(idx),
-                Store(idx) => self.do_store(idx),
-                Print => self.do_print(),
-                Array(size) => self.do_array(size),
-                Len => self.do_len(),
-                Push => self.do_push(),
-                ArrayGet => self.do_array_get(),
 
                 Call(ref target) => {
                     let new_func = &self.module.funcs[target];
-                    let mut frame = CallFrame::for_fn(new_func, (func, pc));
+                    let mut frame = CallFrame::for_fn(new_func, next);
 
-                    for idx in 0..frame.args {
-                        frame.locals[idx] = self.stack.pop().unwrap();
+                    // pass arguments to function locals
+                    for idx in 0..frame.args_count {
+                        frame.locals[idx] = self.stack
+                            .pop()
+                            .expect("Not enough arguments passed");
                     }
 
                     self.frames.push(frame);
-
-                    func = new_func.clone();
-                    pc = 0;
+                    next = InstrPtr::for_fn(new_func.clone());
                 }
 
                 Return => {
-                    let frame = self.frames.pop();
+                    // remove latest callframe
+                    let old_frame = self.frames
+                        .pop()
+                        .expect("Return from non existing frame.");
 
+                    // did we return from main function?
                     if self.frames.is_empty() {
                         break;
+                    } else {
+                        next = old_frame.back_ref;
                     }
-
-                    let (f, rpc) = frame.unwrap().back_ref;
-                    func = f;
-                    pc = rpc;
                 }
 
-                Cmp(how) => self.do_cmp(how),
-
                 Jump(target) => {
-                    pc = target;
+                    next = instr.jump(target);
                 }
 
                 JumpIfFalse(target) => {
-                    if !bool::from(self.stack.pop().unwrap()) {
-                        pc = target;
+                    if let false = self.stack.pop_into::<bool>() {
+                        next = instr.jump(target);
                     }
                 }
 
                 _ => panic!("TODO: {:?}", instr),
-
             }
         }
     }
@@ -446,7 +373,7 @@ impl<'a> Interpreter<'a> {
     }
 
     fn do_const(&mut self, n: usize) {
-        self.stack.push(n.into());
+        self.stack.push_from(n);
     }
 
     fn do_load(&mut self, idx: usize) {
@@ -499,23 +426,23 @@ fn main() {
         funcs: btreemap!{
             "main".into() => Func {
                 name: "main".into(),
-                args: 0,
-                locals: 0,
-                instr: vec![Array(8), Const(9), Push, Const(3), Push, Const(4), Push, Const(5), Push, Const(6), Push, Const(1), Push, Const(3), Push, Const(2), Push, Const(4), Push, Call(String::from("min_list")), Return],
+                args_count: 0,
+                locals_count: 0,
+                instrs: vec![Array(8), Const(9), Push, Const(3), Push, Const(4), Push, Const(5), Push, Const(6), Push, Const(1), Push, Const(3), Push, Const(2), Push, Const(4), Push, Call(String::from("min_list")), Return],
             }.into(),
 
             "min".into() => Func {
                 name: "min".into(),
-                args: 2,
-                locals: 0,
-                instr: vec![Load(1), Load(0), Cmp(self::Comp::Le), JumpIfFalse(6), Load(0), Jump(8), Load(1), Jump(8), Clone, Return]
+                args_count: 2,
+                locals_count: 0,
+                instrs: vec![Load(1), Load(0), Cmp(self::Comp::Le), JumpIfFalse(6), Load(0), Jump(8), Load(1), Jump(8), Clone, Return]
             }.into(),
 
             "min_list".into() => Func {
                 name: "min_list".into(),
-                args: 1,
-                locals: 3,
-                instr: vec![Load(0), Const(0), ArrayGet, Store(1), Load(0), Len, Store(2), Const(0), Store(3), Loop, Load(2), Load(3), Cmp(Comp::Lt), JumpIfFalse(25), Load(0), Load(3), ArrayGet, Load(1), Call(String::from("min")), Store(1), Load(3), Const(1), Add, Store(3), Jump(9), Break, Load(1), Print, Return],
+                args_count: 1,
+                locals_count: 3,
+                instrs: vec![Load(0), Const(0), ArrayGet, Store(1), Load(0), Len, Store(2), Const(0), Store(3), Loop, Load(2), Load(3), Cmp(Comp::Lt), JumpIfFalse(25), Load(0), Load(3), ArrayGet, Load(1), Call(String::from("min")), Store(1), Load(3), Const(1), Add, Store(3), Jump(9), Break, Load(1), Print, Return],
             }.into(),
         }
     };

@@ -1,6 +1,5 @@
 
 pub mod vec {
-
     pub trait ConvertingStack<T> {
         fn pop_into<U>(&mut self) -> U where U: From<T>;
 

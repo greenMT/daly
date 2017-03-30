@@ -43,7 +43,6 @@ impl AsMut<Vec<usize>> for Value {
 }
 
 
-// usize
 impl From<Value> for usize {
     fn from(val: Value) -> Self {
         match val {
@@ -60,36 +59,22 @@ impl From<usize> for Value {
 }
 
 
-// impl<'a> From<&'a Instruction> for TraceInstruction {
-impl From<Instruction> for TraceInstruction {
-    fn from(instr: Instruction) -> TraceInstruction {
+impl<'a> From<&'a Instruction> for TraceInstruction {
+    fn from(instr: &Instruction) -> TraceInstruction {
         use Instruction as I;
         use TraceInstruction as TI;
 
-        match instr {
+        match *instr {
             I::Add => TI::Add,
             I::Cmp(c) => TI::Cmp(c),
             I::Const(c) => TI::Const(c),
-
             I::Len => TI::Len,
             I::Print => TI::Print,
             I::Clone => TI::Clone,
-
             I::Array(u) => TI::Array(u),
             I::ArrayGet => TI::ArrayGet,
 
             _ => panic!("can not convert {:?}", instr),
-        }
-    }
-}
-
-
-impl<'a> From<&'a Func> for FuncInfo {
-    fn from(func: &Func) -> Self {
-        FuncInfo {
-            name: func.name.clone(),
-            args: func.args,
-            locals: func.locals,
         }
     }
 }

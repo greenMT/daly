@@ -5,11 +5,12 @@ use std::fmt;
 use kaktus::Stack;
 
 use super::Func;
+use repr::InstrPtr;
 
 
 pub struct FrameInfo {
     pub func: Rc<Func>,
-    pub back_ref: (Rc<Func>, usize),
+    pub back_ref: InstrPtr,
     // offset of inlined values
     pub offset: usize,
 }

@@ -1,12 +1,11 @@
 
-use std::rc::Rc;
-
+use boolinator::Boolinator;
 use kaktus::PushPop;
 
-use super::{TraceInstruction, Comp, Value, Interpreter, CallFrame, Func, Trace};
+use super::{TraceInstruction, Comp, Value, Interpreter, CallFrame, Trace};
 use recovery::Guard;
 use traits::vec::ConvertingStack;
-
+use repr::InstrPtr;
 
 pub struct Runner<'a, 'b: 'a> {
     pub trace: &'a [TraceInstruction],
@@ -16,9 +15,7 @@ pub struct Runner<'a, 'b: 'a> {
 }
 
 impl<'a, 'b> Runner<'a, 'b> {
-    pub fn new(interp: &'a mut Interpreter<'b>,
-               trace: &'a Trace)
-               -> Self {
+    pub fn new(interp: &'a mut Interpreter<'b>, trace: &'a Trace) -> Self {
         // we have to copy over current stack frame from interpreter
         let mut locals = vec![Value::Null; trace.locals_count];
         {
@@ -36,7 +33,7 @@ impl<'a, 'b> Runner<'a, 'b> {
         }
     }
 
-    pub fn run(&mut self) -> (Rc<Func>, usize) {
+    pub fn run(&mut self) -> InstrPtr {
         use TraceInstruction::*;
 
         let mut pc = 0;
@@ -47,60 +44,68 @@ impl<'a, 'b> Runner<'a, 'b> {
             info!("TEXEC: {:?}", instr);
 
             match *instr {
-                Add => self.add(),
-                Cmp(how) => self.cmp(how),
-
-                Load(idx) => self.load(idx),
+                Add        => self.add(),
+                Cmp(how)   => self.cmp(how),
+                Load(idx)  => self.load(idx),
                 Store(idx) => self.store(idx),
+                ArrayGet   => self.array_get(),
                 Const(val) => self.stack.push_from(val),
-
-                ArrayGet => self.array_get(),
-
-                Clone => (),
+                Clone      => {}
 
                 Guard(ref guard) => {
-                    match self.guard(guard) {
-                        Ok(_) => (),
-                        Err(recovery) => return recovery,
+                    if let Err(recovery) = self.check_guard(guard) {
+                        return recovery;
                     }
                 }
 
-                _ => unimplemented!(),
-                // Array(usize),
-                // Push,
-                // Print,
-                // Len,
+                // these opcodes are not needed for example
+                Array(_) | Push | Print | Len => unimplemented!(),
             }
-
         }
     }
 
-    // XXX: return None guard succeeds
-    fn guard(&mut self, guard: &Guard) -> Result<(), (Rc<Func>, usize)> {
-        let got = self.stack.pop_into::<bool>();
-        if got == guard.condition {
-            Ok(())
-        } else {
-            self.recover(guard);
-            Err((guard.frame.func.clone(), guard.pc))
-        }
+    fn check_guard(&mut self, guard: &Guard) -> Result<(), InstrPtr> {
+        let check = self.stack.pop_into::<bool>() == guard.condition;
+        check.ok_or_else(||{
+                self.recover(guard);
+                InstrPtr::new(guard.frame.func.clone(), guard.pc)
+            })
     }
 
-    /// the following things have to be recovered
-    /// * stack-frames (call-frames)
-    /// * value stack (essentially bool which caused guard to fail)
+    /// Recovery (aka Blackholing)
+    ///
+    /// Execution has reached a point, where the trace isn't valid anymore.
+    /// The goal is to return to the interpreter, but the state has to be
+    /// recovered first.
+    ///
+    /// The following states have to be recovered:
+    ///     * stack-frames (call-frames)
+    ///       The failed guard might have failed within an inlined function call.
+    ///       Thus, we have to reconstruct all missing callframes, before the
+    ///       the interpreter can gain back control.
+    ///       Second, we also have to consider the frame where the loop resides
+    ///       in, since state might have also has changed there.
+    ///
+    ///     * value stack
+    ///       Also the operand stack has to be recovered.
+    ///       Foremost, the condition, which caused the guard to fail, has to be
+    ///       restored.
+    ///       TODO: Are there other values which might have to be recovered?
     fn recover(&mut self, guard: &Guard) {
         // remove the last callframe of the Interpreter
         // it gets replaced with our updated version
         self.interp.frames.pop().unwrap();
 
         // recover callframes
-        // since callframes depend on each other, we start with the one which
-        // was created first
         let frames = guard.frame.walk().collect::<Vec<_>>();
+
+        // since callframes depend on each other, we start with the one which
+        // was created first (least-recent frame) `.rev()` ensures that
         for frame_info in frames.iter().rev() {
-            // 1. create a new callframe
-            let mut frame = CallFrame::for_fn(&*frame_info.func, frame_info.back_ref.clone());
+            // 1. create a new callframe to push
+            let mut frame = CallFrame::for_fn(
+                &frame_info.func,
+                frame_info.back_ref.clone());
 
             // 2. fill it up with locals
             for idx in 0..frame.locals.len() {
@@ -116,7 +121,7 @@ impl<'a, 'b> Runner<'a, 'b> {
     }
 }
 
-/// normal interpreter functions
+// normal interpreter functions
 impl<'a, 'b> Runner<'a, 'b> {
     fn add(&mut self) {
         let (a, b) = self.stack.pop_2_into::<usize>();
